@@ -1,18 +1,17 @@
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
+const { createClient } = require('@libsql/client');
 const bodyParser = require('body-parser');
 const cors = require('cors');
 const path = require('path');
-const fs = require('fs');
 const QRCode = require('qrcode');
 const jsPDF = require('jspdf').jsPDF;
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
-// Domain configuration (default to localhost, can be updated via API)
+// Domain configuration
 let domainConfig = {
-  domain: 'localhost:3000'
+  domain: process.env.DOMAIN || 'localhost:' + PORT
 };
 
 // Middleware
@@ -21,13 +20,20 @@ app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.static('public'));
 
-// Database setup
-const inventoryDb = new sqlite3.Database('./db/inventory.db');
-const transactionsDb = new sqlite3.Database('./db/transactions.db');
+// Database setup (Turso / libsql)
+const inventoryDb = createClient({
+  url: process.env.INVENTORY_DB_URL,
+  authToken: process.env.INVENTORY_DB_TOKEN,
+});
+
+const transactionsDb = createClient({
+  url: process.env.TRANSACTIONS_DB_URL,
+  authToken: process.env.TRANSACTIONS_DB_TOKEN,
+});
 
 // Initialize databases
-inventoryDb.serialize(() => {
-  inventoryDb.run(`
+async function initDatabases() {
+  await inventoryDb.execute(`
     CREATE TABLE IF NOT EXISTS materials (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT UNIQUE NOT NULL,
@@ -37,23 +43,20 @@ inventoryDb.serialize(() => {
     )
   `);
 
-  // Insert initial materials if they don't exist
   const initialMaterials = [
     { name: 'Wood Panels', unit: 'pieces', quantity: 5 },
     { name: 'PVC Cables', unit: 'meters', quantity: 5 },
     { name: '3D Filament', unit: 'kg', quantity: 5 }
   ];
 
-  initialMaterials.forEach(material => {
-    inventoryDb.run(
-      'INSERT OR IGNORE INTO materials (name, unit, quantity) VALUES (?, ?, ?)',
-      [material.name, material.unit, material.quantity]
-    );
-  });
-});
+  for (const material of initialMaterials) {
+    await inventoryDb.execute({
+      sql: 'INSERT OR IGNORE INTO materials (name, unit, quantity) VALUES (?, ?, ?)',
+      args: [material.name, material.unit, material.quantity]
+    });
+  }
 
-transactionsDb.serialize(() => {
-  transactionsDb.run(`
+  await transactionsDb.execute(`
     CREATE TABLE IF NOT EXISTS transactions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       material_name TEXT NOT NULL,
@@ -64,228 +67,197 @@ transactionsDb.serialize(() => {
       timestamp TEXT NOT NULL
     )
   `);
-});
 
-// API Routes
+  console.log('✅ Databases initialized');
+}
+
+// ─── API Routes ───────────────────────────────────────────────────────────────
 
 // Get all materials
-app.get('/api/materials', (req, res) => {
-  inventoryDb.all('SELECT * FROM materials ORDER BY name', [], (err, rows) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
-    res.json(rows);
-  });
+app.get('/api/materials', async (req, res) => {
+  try {
+    const result = await inventoryDb.execute('SELECT * FROM materials ORDER BY name');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Get specific material by name
-app.get('/api/materials/:name', (req, res) => {
+app.get('/api/materials/:name', async (req, res) => {
   const materialName = decodeURIComponent(req.params.name);
-  inventoryDb.get(
-    'SELECT * FROM materials WHERE name = ?',
-    [materialName],
-    (err, row) => {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-      if (!row) {
-        return res.status(404).json({ error: 'Material not found' });
-      }
-      res.json(row);
+  try {
+    const result = await inventoryDb.execute({
+      sql: 'SELECT * FROM materials WHERE name = ?',
+      args: [materialName]
+    });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Material not found' });
     }
-  );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Add new material
-app.post('/api/materials', (req, res) => {
+app.post('/api/materials', async (req, res) => {
   const { name, unit, quantity } = req.body;
-
   if (!name || !unit || quantity === undefined) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
-
-  inventoryDb.run(
-    'INSERT INTO materials (name, unit, quantity) VALUES (?, ?, ?)',
-    [name, unit, quantity],
-    function(err) {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-      res.json({ id: this.lastID, name, unit, quantity });
-    }
-  );
+  try {
+    const result = await inventoryDb.execute({
+      sql: 'INSERT INTO materials (name, unit, quantity) VALUES (?, ?, ?)',
+      args: [name, unit, quantity]
+    });
+    res.json({ id: Number(result.lastInsertRowid), name, unit, quantity });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Update material quantity
-app.put('/api/materials/:name', (req, res) => {
+app.put('/api/materials/:name', async (req, res) => {
   const materialName = decodeURIComponent(req.params.name);
   const { quantity } = req.body;
-
   if (quantity === undefined) {
     return res.status(400).json({ error: 'Quantity is required' });
   }
-
-  inventoryDb.run(
-    'UPDATE materials SET quantity = ? WHERE name = ?',
-    [quantity, materialName],
-    function(err) {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-      if (this.changes === 0) {
-        return res.status(404).json({ error: 'Material not found' });
-      }
-      res.json({ success: true, materialName, quantity });
+  try {
+    const result = await inventoryDb.execute({
+      sql: 'UPDATE materials SET quantity = ? WHERE name = ?',
+      args: [quantity, materialName]
+    });
+    if (result.rowsAffected === 0) {
+      return res.status(404).json({ error: 'Material not found' });
     }
-  );
+    res.json({ success: true, materialName, quantity });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Delete material
-app.delete('/api/materials/:name', (req, res) => {
+app.delete('/api/materials/:name', async (req, res) => {
   const materialName = decodeURIComponent(req.params.name);
-
-  inventoryDb.run(
-    'DELETE FROM materials WHERE name = ?',
-    [materialName],
-    function(err) {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-      if (this.changes === 0) {
-        return res.status(404).json({ error: 'Material not found' });
-      }
-      res.json({ success: true });
+  try {
+    const result = await inventoryDb.execute({
+      sql: 'DELETE FROM materials WHERE name = ?',
+      args: [materialName]
+    });
+    if (result.rowsAffected === 0) {
+      return res.status(404).json({ error: 'Material not found' });
     }
-  );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// Submit transaction (check-in/check-out)
-app.post('/api/transactions', (req, res) => {
+// Submit transaction (check-in / check-out)
+app.post('/api/transactions', async (req, res) => {
   const { materialName, userName, userEmail, action, quantity } = req.body;
-
   if (!materialName || !userName || !userEmail || !action || !quantity) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
 
-  // First, get current material quantity
-  inventoryDb.get(
-    'SELECT quantity FROM materials WHERE name = ?',
-    [materialName],
-    (err, row) => {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-      if (!row) {
-        return res.status(404).json({ error: 'Material not found' });
-      }
-
-      const currentQuantity = row.quantity;
-      let newQuantity;
-
-      if (action === 'check-out') {
-        if (quantity > currentQuantity) {
-          return res.status(400).json({ 
-            error: `Insufficient quantity. Only ${currentQuantity} available.` 
-          });
-        }
-        newQuantity = currentQuantity - quantity;
-      } else if (action === 'check-in') {
-        newQuantity = currentQuantity + quantity;
-      } else {
-        return res.status(400).json({ error: 'Invalid action' });
-      }
-
-      // Update inventory
-      inventoryDb.run(
-        'UPDATE materials SET quantity = ? WHERE name = ?',
-        [newQuantity, materialName],
-        (err) => {
-          if (err) {
-            return res.status(500).json({ error: err.message });
-          }
-
-          // Record transaction
-          const estDate = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
-          transactionsDb.run(
-            `INSERT INTO transactions (material_name, user_name, user_email, action, quantity, timestamp)
-             VALUES (?, ?, ?, ?, ?, ?)`,
-            [materialName, userName, userEmail, action, quantity, estDate],
-            function(err) {
-              if (err) {
-                return res.status(500).json({ error: err.message });
-              }
-              res.json({
-                success: true,
-                transactionId: this.lastID,
-                newQuantity
-              });
-            }
-          );
-        }
-      );
+  try {
+    // Get current quantity
+    const matResult = await inventoryDb.execute({
+      sql: 'SELECT quantity FROM materials WHERE name = ?',
+      args: [materialName]
+    });
+    if (matResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Material not found' });
     }
-  );
+
+    const currentQuantity = matResult.rows[0].quantity;
+    let newQuantity;
+
+    if (action === 'check-out') {
+      if (quantity > currentQuantity) {
+        return res.status(400).json({
+          error: `Insufficient quantity. Only ${currentQuantity} available.`
+        });
+      }
+      newQuantity = currentQuantity - quantity;
+    } else if (action === 'check-in') {
+      newQuantity = currentQuantity + quantity;
+    } else {
+      return res.status(400).json({ error: 'Invalid action' });
+    }
+
+    // Update inventory
+    await inventoryDb.execute({
+      sql: 'UPDATE materials SET quantity = ? WHERE name = ?',
+      args: [newQuantity, materialName]
+    });
+
+    // Record transaction
+    const estDate = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
+    const txResult = await transactionsDb.execute({
+      sql: `INSERT INTO transactions (material_name, user_name, user_email, action, quantity, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)`,
+      args: [materialName, userName, userEmail, action, quantity, estDate]
+    });
+
+    res.json({
+      success: true,
+      transactionId: Number(txResult.lastInsertRowid),
+      newQuantity
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Get all transactions
-app.get('/api/transactions', (req, res) => {
-  transactionsDb.all(
-    'SELECT * FROM transactions ORDER BY timestamp DESC',
-    [],
-    (err, rows) => {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-      res.json(rows);
-    }
-  );
+app.get('/api/transactions', async (req, res) => {
+  try {
+    const result = await transactionsDb.execute(
+      'SELECT * FROM transactions ORDER BY timestamp DESC'
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Get transactions for a specific material
-app.get('/api/transactions/:materialName', (req, res) => {
+app.get('/api/transactions/:materialName', async (req, res) => {
   const materialName = decodeURIComponent(req.params.materialName);
-  transactionsDb.all(
-    'SELECT * FROM transactions WHERE material_name = ? ORDER BY timestamp DESC',
-    [materialName],
-    (err, rows) => {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
-      res.json(rows);
-    }
-  );
+  try {
+    const result = await transactionsDb.execute({
+      sql: 'SELECT * FROM transactions WHERE material_name = ? ORDER BY timestamp DESC',
+      args: [materialName]
+    });
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// QR Code endpoints
+// ─── QR Code / Config Routes ──────────────────────────────────────────────────
 
-// Get domain configuration
 app.get('/api/config/domain', (req, res) => {
   res.json(domainConfig);
 });
 
-// Update domain configuration
 app.put('/api/config/domain', (req, res) => {
   const { domain } = req.body;
-  if (!domain) {
-    return res.status(400).json({ error: 'Domain is required' });
-  }
+  if (!domain) return res.status(400).json({ error: 'Domain is required' });
   domainConfig.domain = domain;
   res.json({ success: true, domain: domainConfig.domain });
 });
 
-// Generate QR code for a single material
 app.get('/api/qr/:materialName', async (req, res) => {
   const materialName = decodeURIComponent(req.params.materialName);
-  const materialUrl = `http://${domainConfig.domain}/material/${encodeURIComponent(materialName)}`;
-  
+  const materialUrl = `https://${domainConfig.domain}/material/${encodeURIComponent(materialName)}`;
   try {
     const qrImage = await QRCode.toDataURL(materialUrl, {
-      width: 200,
-      margin: 2,
-      color: {
-        dark: '#000000',
-        light: '#FFFFFF'
-      }
+      width: 200, margin: 2,
+      color: { dark: '#000000', light: '#FFFFFF' }
     });
     res.json({ qrCode: qrImage, url: materialUrl });
   } catch (error) {
@@ -293,21 +265,14 @@ app.get('/api/qr/:materialName', async (req, res) => {
   }
 });
 
-// Generate QR code as PNG file
 app.get('/api/qr/:materialName/download', async (req, res) => {
   const materialName = decodeURIComponent(req.params.materialName);
-  const materialUrl = `http://${domainConfig.domain}/material/${encodeURIComponent(materialName)}`;
-  
+  const materialUrl = `https://${domainConfig.domain}/material/${encodeURIComponent(materialName)}`;
   try {
     const qrImage = await QRCode.toBuffer(materialUrl, {
-      width: 200,
-      margin: 2,
-      color: {
-        dark: '#000000',
-        light: '#FFFFFF'
-      }
+      width: 200, margin: 2,
+      color: { dark: '#000000', light: '#FFFFFF' }
     });
-    
     res.setHeader('Content-Type', 'image/png');
     res.setHeader('Content-Disposition', `attachment; filename="QR_${materialName.replace(/\s+/g, '_')}.png"`);
     res.send(qrImage);
@@ -316,94 +281,61 @@ app.get('/api/qr/:materialName/download', async (req, res) => {
   }
 });
 
-// Generate PDF with all material QR codes
 app.get('/api/qr/all/pdf', async (req, res) => {
   try {
-    // Get all materials
-    inventoryDb.all('SELECT * FROM materials ORDER BY name', [], async (err, materials) => {
-      if (err) {
-        return res.status(500).json({ error: err.message });
+    const matResult = await inventoryDb.execute('SELECT * FROM materials ORDER BY name');
+    const materials = matResult.rows;
+
+    const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+    let yPosition = 20;
+    const pageHeight = doc.internal.pageSize.getHeight();
+
+    for (const material of materials) {
+      if (yPosition > pageHeight - 80) {
+        doc.addPage();
+        yPosition = 20;
       }
+      const materialUrl = `https://${domainConfig.domain}/material/${encodeURIComponent(material.name)}`;
+      const qrImage = await QRCode.toDataURL(materialUrl, {
+        width: 200, margin: 2,
+        color: { dark: '#000000', light: '#FFFFFF' }
+      });
+      doc.addImage(qrImage, 'PNG', 30, yPosition, 60, 60);
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(12);
+      doc.text(`Material: ${material.name}`, 100, yPosition + 10);
+      doc.text(`Unit: ${material.unit}`, 100, yPosition + 20);
+      doc.text(`Available: ${material.quantity}`, 100, yPosition + 30);
+      yPosition += 80;
+    }
 
-      try {
-        // Create PDF
-        const doc = new jsPDF({
-          orientation: 'portrait',
-          unit: 'mm',
-          format: 'a4'
-        });
-
-        let yPosition = 20;
-        const pageHeight = doc.internal.pageSize.getHeight();
-
-        for (const material of materials) {
-          // Check if we need a new page
-          if (yPosition > pageHeight - 80) {
-            doc.addPage();
-            yPosition = 20;
-          }
-
-          // Generate QR code
-          const materialUrl = `http://${domainConfig.domain}/material/${encodeURIComponent(material.name)}`;
-          const qrImage = await QRCode.toDataURL(materialUrl, {
-            width: 200,
-            margin: 2,
-            color: {
-              dark: '#000000',
-              light: '#FFFFFF'
-            }
-          });
-
-          // Add QR code to PDF
-          doc.addImage(qrImage, 'PNG', 30, yPosition, 60, 60);
-
-          // Add material info
-          doc.setFont('helvetica', 'normal');
-          doc.setFontSize(12);
-          doc.text(`Material: ${material.name}`, 100, yPosition + 10);
-          doc.text(`Unit: ${material.unit}`, 100, yPosition + 20);
-          doc.text(`Available: ${material.quantity}`, 100, yPosition + 30);
-
-          yPosition += 80;
-        }
-
-        // Send PDF
-        const pdfBuffer = Buffer.from(doc.output('arraybuffer'));
-        res.setHeader('Content-Type', 'application/pdf');
-        res.setHeader('Content-Disposition', 'attachment; filename="BDW_Material_QR_Codes.pdf"');
-        res.send(pdfBuffer);
-      } catch (innerError) {
-        console.error('Error generating PDF:', innerError);
-        res.status(500).json({ error: 'Failed to generate PDF', details: innerError.message });
-      }
-    });
+    const pdfBuffer = Buffer.from(doc.output('arraybuffer'));
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename="BDW_Material_QR_Codes.pdf"');
+    res.send(pdfBuffer);
   } catch (error) {
-    console.error('Error in PDF endpoint:', error);
-    res.status(500).json({ error: 'Failed to generate PDF' });
+    console.error('Error generating PDF:', error);
+    res.status(500).json({ error: 'Failed to generate PDF', details: error.message });
   }
 });
 
-// Serve HTML pages
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
+// ─── HTML Pages ───────────────────────────────────────────────────────────────
 
-app.get('/admin', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'admin.html'));
-});
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'public', 'admin.html')));
+app.get('/history', (req, res) => res.sendFile(path.join(__dirname, 'public', 'history.html')));
+app.get('/material/:name', (req, res) => res.sendFile(path.join(__dirname, 'public', 'material.html')));
 
-app.get('/history', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'history.html'));
-});
+// ─── Start ────────────────────────────────────────────────────────────────────
 
-// Dynamic material pages
-app.get('/material/:name', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'material.html'));
-});
-
-// Start server
-app.listen(PORT, () => {
-  console.log(`🚀 Brown Design Workshop Material Circulation Station`);
-  console.log(`📍 Server running at http://localhost:${PORT}`);
-  console.log(`📦 Database initialized with 3 materials`);
-});
+initDatabases()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`🚀 Brown Design Workshop Material Circulation Station`);
+      console.log(`📍 Server running at http://localhost:${PORT}`);
+    });
+  })
+  .catch(err => {
+    console.error('❌ Failed to initialize databases:', err);
+    process.exit(1);
+  });
